@@ -21,7 +21,10 @@ env:
 jobs:
   build:
     name: ${{ matrix.name }}
-    runs-on: macos-15
+    # macOS 目标用到 NSButton.BezelStyle.glass，该符号只存在于 macOS 26 SDK，
+    # 因此必须是 Xcode 26（macos-26）。macos-15 上的 Xcode 16 会在编译期报
+    # "type 'NSButton.BezelStyle' has no member 'glass'"，#available 守卫无法绕过。
+    runs-on: macos-26
     timeout-minutes: 45
     strategy:
       fail-fast: false
