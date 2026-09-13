@@ -1,0 +1,135 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Scheme 在 Debug Run 时会把 App 安装到 /Applications，CI 上跳过。
+  WLOC_SKIP_DEBUG_INSTALL: "1"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: macos-15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: iOS (Simulator)
+            scheme: WLocApp-iOS
+            destination: generic/platform=iOS Simulator
+            # Xcode 16 / 26 支持的最低 iOS 部署目标是 15.0，工程内的 12.0 会被工具链拒绝。
+            deployment: IPHONEOS_DEPLOYMENT_TARGET=15.0
+          - name: macOS
+            scheme: WLocApp-macOS
+            destination: platform=macOS
+            deployment: MACOSX_DEPLOYMENT_TARGET=13.0
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 打印工具链版本
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks
+          swift --version
+          sw_vers
+
+      - name: 准备 OpenSSL 3
+        # macOS 自带的是 LibreSSL，缺少生成 p12 所需的 -legacy，必须换成 Homebrew 的 openssl@3。
+        run: |
+          set -euo pipefail
+          for candidate in \
+            "$(brew --prefix 2>/dev/null || echo /nonexistent)/opt/openssl@3/bin" \
+            /opt/homebrew/opt/openssl@3/bin \
+            /usr/local/opt/openssl@3/bin
+          do
+            if [ -x "$candidate/openssl" ]; then
+              echo "使用 $candidate/openssl"
+              echo "$candidate" >> "$GITHUB_PATH"
+              exit 0
+            fi
+          done
+          brew install openssl@3
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+
+      - name: 生成本地 TLS 证书
+        # 仓库不包含证书（见 .gitignore），但工程引用了它们，缺少时构建会直接失败。
+        run: |
+          set -euo pipefail
+          openssl version
+          ./generate_apple_wloc_p12.sh
+          ls -l Resources/iOS Resources/macOS Resources/Tunnel
+
+      - name: 准备 CocoaPods
+        run: |
+          set -euo pipefail
+          if ! command -v pod >/dev/null 2>&1; then
+            gem install cocoapods -v 1.16.2 --no-document
+          fi
+          pod --version
+
+      - name: 缓存 CocoaPods 规格仓库
+        uses: actions/cache@v4
+        with:
+          path: ~/.cocoapods
+          key: cocoapods-${{ runner.os }}-${{ hashFiles('Podfile.lock') }}
+          restore-keys: |
+            cocoapods-${{ runner.os }}-
+
+      - name: pod install
+        run: pod install
+
+      - name: 构建（不签名，仅验证编译）
+        # 工程使用 Manual 签名并写死了 Team 与描述文件，CI 上不具备，
+        # 因此关闭签名。需要出可安装的包时，见文件末尾的说明。
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -workspace WLocApp.xcworkspace \
+            -scheme "${{ matrix.scheme }}" \
+            -configuration Debug \
+            -destination "${{ matrix.destination }}" \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            "${{ matrix.deployment }}" \
+            build
+
+      - name: 上传构建产物
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: WLoc-${{ matrix.name == 'macOS' && 'macOS' || 'iOS' }}-Debug
+          path: build/DerivedData/Build/Products/Debug-*
+          if-no-files-found: ignore
+          retention-days: 7
+
+# ---------------------------------------------------------------------------
+# 需要签名产物（.app / .ipa / .dmg）时：
+#   1. 在仓库 Settings -> Secrets and variables -> Actions 添加：
+#        BUILD_CERTIFICATE_BASE64   （.p12 的 base64）
+#        P12_PASSWORD
+#        BUILD_PROVISION_PROFILE_BASE64
+#        KEYCHAIN_PASSWORD
+#   2. 移除上面的 CODE_SIGNING_ALLOWED=NO / CODE_SIGNING_REQUIRED=NO / CODE_SIGN_IDENTITY=""，
+#      改用 -allowProvisioningUpdates -authenticationKeyPath ...（App Store Connect API Key），
+#      或先把证书导入临时 keychain 再 xcodebuild archive。
+#   3. 同时需要把 project.pbxproj 里写死的
+#      DEVELOPMENT_TEAM = CDAW7B5WR4 和 PROVISIONING_PROFILE_SPECIFIER=apploc_*
+#      替换成你自己的值，否则签名阶段会报 profile 不匹配。
+# ---------------------------------------------------------------------------
